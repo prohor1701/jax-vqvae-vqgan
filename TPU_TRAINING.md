@@ -37,11 +37,18 @@ Quantized: 16×16 tokens = 256 tokens ≤ 256 ✓
 ```
 
 ### For KL-VAE (Continuous VAE)
-To meet the <8192 requirement, use 5 downsamples:
+To meet the <8192 requirement, use 5 downsamples with embedding_dim=127:
 ```
 Input: 256×256×3 = 196,608 values
 ↓ Encoder with 5 downsamples (256→128→64→32→16→8)
-Latent: 8×8×128 = 8,192 values < 8192 ✓
+Latent: 8×8×127 = 8,128 values < 8192 ✓
+```
+
+Alternative: Use 6 downsamples with larger embedding:
+```
+Input: 256×256×3 = 196,608 values
+↓ Encoder with 6 downsamples (256→128→64→32→16→8→4)
+Latent: 4×4×255 = 4,080 values < 8192 ✓
 ```
 
 ### For FSQ (Finite Scalar Quantization)
@@ -93,7 +100,7 @@ python train.py \
   --wandb.name KL-VAE-TPUv5t \
   --dataset_name imagenet256 \
   --model.quantizer_type kl \
-  --model.embedding_dim 128 \
+  --model.embedding_dim 127 \
   --model.channel_multipliers 1,1,2,2,4,4 \
   --model.g_adversarial_loss_weight 0.1 \
   --model.perceptual_loss_weight 0.1 \
