@@ -43,6 +43,10 @@ flags.DEFINE_integer('eval_interval', 20000, 'Eval interval.')
 flags.DEFINE_integer('save_interval', 200000, 'Eval interval.')
 flags.DEFINE_integer('batch_size', 256, 'Total Batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
+flags.DEFINE_integer('num_epochs', 100, 'Number of training epochs.')
+flags.DEFINE_integer('steps_per_epoch', 5000, 'Steps per epoch (for epoch-based logging).')
+flags.DEFINE_integer('save_epoch_interval', 10, 'Save model every N epochs.')
+flags.DEFINE_integer('eval_epoch_interval', 10, 'Evaluate and generate reconstructions every N epochs.')
 
 model_config = ml_collections.ConfigDict({
     # VQVAE
@@ -103,6 +107,22 @@ def sigmoid_cross_entropy_with_logits(*, labels: jnp.ndarray, logits: jnp.ndarra
     neg_abs_logits = jnp.where(condition, -logits, logits)
     return relu_logits - logits * labels + jnp.log1p(jnp.exp(neg_abs_logits))
 
+def calculate_psnr(original, reconstructed, max_val=1.0):
+    """Calculate Peak Signal-to-Noise Ratio."""
+    mse = jnp.mean((original - reconstructed) ** 2)
+    # Avoid log(0)
+    mse = jnp.maximum(mse, 1e-10)
+    psnr = 20 * jnp.log10(max_val) - 10 * jnp.log10(mse)
+    return psnr
+
+def calculate_l1_loss(original, reconstructed):
+    """Calculate L1 (MAE) loss."""
+    return jnp.mean(jnp.abs(original - reconstructed))
+
+def calculate_l2_loss(original, reconstructed):
+    """Calculate L2 (MSE) loss."""
+    return jnp.mean((original - reconstructed) ** 2)
+
 class VQGANModel(flax.struct.PyTreeNode):
     rng: Any
     config: dict = flax.struct.field(pytree_node=False)
@@ -147,6 +167,8 @@ class VQGANModel(flax.struct.PyTreeNode):
             perceptual_loss = jnp.mean((real_pools - fake_pools)**2)
 
             l2_loss = jnp.mean((reconstructed_images - images) ** 2)
+            l1_loss = jnp.mean(jnp.abs(reconstructed_images - images))
+            psnr = calculate_psnr(images, reconstructed_images)
             quantizer_loss = result_dict['quantizer_loss'] if 'quantizer_loss' in result_dict else 0.0
             if self.config['quantizer_type'] == 'kl':
                 quantizer_loss = quantizer_loss * self.config['kl_weight']
@@ -159,7 +181,12 @@ class VQGANModel(flax.struct.PyTreeNode):
                 'loss_vae': loss_vae,
                 'loss_d': loss_d,
                 'l2_loss': l2_loss,
+                'l1_loss': l1_loss,
+                'psnr': psnr,
                 'd_loss_for_vae': d_loss_for_vae,
+                'd_loss_real': d_loss_real,
+                'd_loss_fake': d_loss_fake,
+                'gradient_penalty': penalty,
                 'perceptual_loss': perceptual_loss,
                 'quantizer_loss': quantizer_loss,
                 'codebook_usage': codebook_usage,
@@ -284,6 +311,45 @@ def main(_):
     discriminator_ts = TrainState.create(discriminator_def, discriminator_params, tx=tx)
     print("Total num of Discriminator parameters:", sum(x.size for x in jax.tree_util.tree_leaves(discriminator_params)))
 
+    # Print compression information
+    print("\n" + "="*80)
+    print("COMPRESSION INFORMATION")
+    print("="*80)
+    print(f"Input image size: {FLAGS.model.image_size}x{FLAGS.model.image_size}x{FLAGS.model.image_channels}")
+    print(f"Total input values: {FLAGS.model.image_size * FLAGS.model.image_size * FLAGS.model.image_channels}")
+    
+    # Calculate latent dimensions based on channel_multipliers
+    num_downsamples = len(FLAGS.model.channel_multipliers) - 1
+    latent_h = FLAGS.model.image_size // (2 ** num_downsamples)
+    latent_w = FLAGS.model.image_size // (2 ** num_downsamples)
+    
+    if FLAGS.model.quantizer_type == 'vq':
+        num_tokens = latent_h * latent_w
+        num_values = num_tokens * FLAGS.model.embedding_dim
+        print(f"Quantizer type: VQ (Vector Quantization)")
+        print(f"Latent spatial size: {latent_h}x{latent_w}")
+        print(f"Embedding dimension: {FLAGS.model.embedding_dim}")
+        print(f"Number of tokens: {num_tokens} (≤256: {'✓' if num_tokens <= 256 else '✗'})")
+        print(f"Total values: {num_values}")
+    elif FLAGS.model.quantizer_type == 'kl':
+        num_values = latent_h * latent_w * FLAGS.model.embedding_dim
+        print(f"Quantizer type: KL (Continuous VAE)")
+        print(f"Latent spatial size: {latent_h}x{latent_w}")
+        print(f"Embedding dimension: {FLAGS.model.embedding_dim}")
+        print(f"Total values: {num_values} (<8192: {'✓' if num_values < 8192 else '✗'})")
+    elif FLAGS.model.quantizer_type == 'fsq':
+        num_tokens = latent_h * latent_w
+        num_values = num_tokens * FLAGS.model.embedding_dim
+        print(f"Quantizer type: FSQ (Finite Scalar Quantization)")
+        print(f"Latent spatial size: {latent_h}x{latent_w}")
+        print(f"Embedding dimension: {FLAGS.model.embedding_dim}")
+        print(f"Number of tokens: {num_tokens} (≤256: {'✓' if num_tokens <= 256 else '✗'})")
+        print(f"Total values: {num_values}")
+    
+    compression_ratio = (FLAGS.model.image_size * FLAGS.model.image_size * FLAGS.model.image_channels) / num_values
+    print(f"Compression ratio: {compression_ratio:.1f}x")
+    print("="*80 + "\n")
+
     model = VQGANModel(rng=rng, vqvae=vqvae_ts, vqvae_eps=vqvae_eps_ts, discriminator=discriminator_ts, config=FLAGS.model)
 
     if FLAGS.load_dir is not None:
@@ -298,7 +364,10 @@ def main(_):
     # Train Loop
     ###################################
     
-    for i in tqdm.tqdm(range(1, FLAGS.max_steps + 1),
+    total_steps = FLAGS.num_epochs * FLAGS.steps_per_epoch
+    print(f"Training for {FLAGS.num_epochs} epochs, {FLAGS.steps_per_epoch} steps per epoch = {total_steps} total steps")
+    
+    for i in tqdm.tqdm(range(1, total_steps + 1),
                        smoothing=0.1,
                        dynamic_ncols=True):
 
@@ -307,73 +376,119 @@ def main(_):
 
         model, update_info = model.update(batch_images)
 
+        # Calculate current epoch
+        current_epoch = (i - 1) // FLAGS.steps_per_epoch + 1
+        step_in_epoch = (i - 1) % FLAGS.steps_per_epoch + 1
+        is_epoch_end = (i % FLAGS.steps_per_epoch == 0)
+
         if i % FLAGS.log_interval == 0:
             update_info = jax.tree_map(lambda x: x.mean(), update_info)
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
+            train_metrics['epoch'] = current_epoch
+            train_metrics['step_in_epoch'] = step_in_epoch
             if jax.process_index() == 0:
                 wandb.log(train_metrics, step=i)
 
-        if i % FLAGS.eval_interval == 0:
-            # Print some images
-            reconstructed_images = model.reconstruction(batch_images) # [devices, 8, 256, 256, 3]
+        # Evaluation and reconstruction generation at the end of specified epochs
+        if is_epoch_end and (current_epoch % FLAGS.eval_epoch_interval == 0):
+            print(f"\n=== Epoch {current_epoch} Evaluation ===")
+            
+            # Generate reconstructions on training data
+            reconstructed_images = model.reconstruction(batch_images) # [devices, batch_per_device, 256, 256, 3]
+            
+            # Generate reconstructions on validation data
             valid_images = next(dataset_valid)
             valid_images = valid_images.reshape((len(jax.local_devices()), -1, *valid_images.shape[1:])) # [devices, batch//devices, etc..]
-            valid_reconstructed_images = model.reconstruction(valid_images) # [devices, 8, 256, 256, 3]
+            valid_reconstructed_images = model.reconstruction(valid_images) # [devices, batch_per_device, 256, 256, 3]
 
             if jax.process_index() == 0:
-                wandb.log({'batch_image_mean': batch_images.mean()}, step=i)
-                wandb.log({'reconstructed_images_mean': reconstructed_images.mean()}, step=i)
-                wandb.log({'batch_image_std': batch_images.std()}, step=i)
-                wandb.log({'reconstructed_images_std': reconstructed_images.std()}, step=i)
+                # Log image statistics
+                wandb.log({
+                    'epoch_eval/train_image_mean': batch_images.mean(),
+                    'epoch_eval/train_reconstructed_mean': reconstructed_images.mean(),
+                    'epoch_eval/train_image_std': batch_images.std(),
+                    'epoch_eval/train_reconstructed_std': reconstructed_images.std(),
+                    'epoch_eval/valid_image_mean': valid_images.mean(),
+                    'epoch_eval/valid_reconstructed_mean': valid_reconstructed_images.mean(),
+                }, step=i)
 
-                # plot comparison witah matplotlib. put each reconstruction side by side.
+                # Plot training reconstructions
                 fig, axs = plt.subplots(2, 8, figsize=(30, 15))
                 for j in range(8):
                     axs[0, j].imshow(batch_images[j, 0], vmin=0, vmax=1)
+                    axs[0, j].axis('off')
+                    axs[0, j].set_title('Original')
                     axs[1, j].imshow(reconstructed_images[j, 0], vmin=0, vmax=1)
-                wandb.log({'reconstruction': wandb.Image(fig)}, step=i)
+                    axs[1, j].axis('off')
+                    axs[1, j].set_title('Reconstructed')
+                plt.suptitle(f'Training Reconstructions - Epoch {current_epoch}')
+                wandb.log({'epoch_eval/reconstruction_train': wandb.Image(fig)}, step=i)
                 plt.close(fig)
+                
+                # Plot validation reconstructions
                 fig, axs = plt.subplots(2, 8, figsize=(30, 15))
                 for j in range(8):
                     axs[0, j].imshow(valid_images[j, 0], vmin=0, vmax=1)
+                    axs[0, j].axis('off')
+                    axs[0, j].set_title('Original')
                     axs[1, j].imshow(valid_reconstructed_images[j, 0], vmin=0, vmax=1)
-                wandb.log({'reconstruction_valid': wandb.Image(fig)}, step=i)
+                    axs[1, j].axis('off')
+                    axs[1, j].set_title('Reconstructed')
+                plt.suptitle(f'Validation Reconstructions - Epoch {current_epoch}')
+                wandb.log({'epoch_eval/reconstruction_valid': wandb.Image(fig)}, step=i)
                 plt.close(fig)
 
-            # Validation Losses
+            # Compute validation losses with proper metrics
             _, valid_update_info = model.update(valid_images)
             valid_update_info = jax.tree_map(lambda x: x.mean(), valid_update_info)
             valid_metrics = {f'validation/{k}': v for k, v in valid_update_info.items()}
+            valid_metrics['epoch'] = current_epoch
             if jax.process_index() == 0:
                 wandb.log(valid_metrics, step=i)
+                print(f"Validation L2 loss: {valid_update_info['l2_loss']:.6f}")
+                print(f"Validation L1 loss: {valid_update_info['l1_loss']:.6f}")
+                print(f"Validation PSNR: {valid_update_info['psnr']:.2f} dB")
+                print(f"Validation Perceptual loss: {valid_update_info['perceptual_loss']:.6f}")
 
-            # FID measurement.
+            # FID measurement (less frequent due to computational cost)
+            # FID measurement (less frequent due to computational cost)
+            print("Computing FID score...")
             activations = []
             for _ in range(64):
-                valid_images = next(dataset_valid)
-                valid_images = valid_images.reshape((len(jax.local_devices()), -1, *valid_images.shape[1:])) # [devices, batch//devices, etc..]
-                valid_reconstructed_images = model.reconstruction(valid_images) # [devices, 8, 256, 256, 3]
-                valid_reconstructed_images = jax.image.resize(valid_reconstructed_images, (valid_images.shape[0], valid_images.shape[1], 299, 299, 3),
+                valid_images_fid = next(dataset_valid)
+                valid_images_fid = valid_images_fid.reshape((len(jax.local_devices()), -1, *valid_images_fid.shape[1:])) # [devices, batch//devices, etc..]
+                valid_reconstructed_images_fid = model.reconstruction(valid_images_fid) # [devices, batch_per_device, 256, 256, 3]
+                valid_reconstructed_images_fid = jax.image.resize(valid_reconstructed_images_fid, 
+                                                               (valid_images_fid.shape[0], valid_images_fid.shape[1], 299, 299, 3),
                                                                method='bilinear', antialias=False)
-                valid_reconstructed_images = 2 * valid_reconstructed_images - 1
-                activations += [np.array(get_fid_activations(valid_reconstructed_images))[..., 0, 0, :]]
-                # TODO: use all_gather to get activations from all devices.
+                valid_reconstructed_images_fid = 2 * valid_reconstructed_images_fid - 1
+                activations += [np.array(get_fid_activations(valid_reconstructed_images_fid))[..., 0, 0, :]]
             activations = np.concatenate(activations, axis=0)
             activations = activations.reshape((-1, activations.shape[-1]))
             mu1 = np.mean(activations, axis=0)
             sigma1 = np.cov(activations, rowvar=False)
             fid = fid_from_stats(mu1, sigma1, truth_fid_stats['mu'], truth_fid_stats['sigma'])
             if jax.process_index() == 0:
-                wandb.log({'validation/fid': fid}, step=i)
+                wandb.log({'validation/fid': fid, 'epoch': current_epoch}, step=i)
+                print(f"FID Score: {fid:.2f}")
 
-
-
-        if (i % FLAGS.save_interval == 0) and (FLAGS.save_dir is not None):
+        # Save checkpoint every N epochs
+        if is_epoch_end and (current_epoch % FLAGS.save_epoch_interval == 0) and (FLAGS.save_dir is not None):
             if jax.process_index() == 0:
+                print(f"\nSaving checkpoint for epoch {current_epoch}...")
                 model_single = flax.jax_utils.unreplicate(model)
-                cp = Checkpoint(FLAGS.save_dir)
+                # Save with epoch number in filename
+                epoch_save_dir = f"{FLAGS.save_dir}/epoch_{current_epoch:04d}"
+                cp = Checkpoint(epoch_save_dir)
                 cp.set_model(model_single)
                 cp.save()
+                print(f"Checkpoint saved to {epoch_save_dir}")
+                
+                # Also save to main directory (latest)
+                cp_latest = Checkpoint(FLAGS.save_dir)
+                cp_latest.set_model(model_single)
+                cp_latest.save()
+                print(f"Latest checkpoint saved to {FLAGS.save_dir}")
 
 if __name__ == '__main__':
     app.run(main)
